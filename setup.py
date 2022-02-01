@@ -18,6 +18,9 @@ setuptools.setup(
     ),
     install_requires=[
         "aws-cdk.core==1.142.0",
+        "aws-cdk.aws_lambda==1.142.0",
+        "aws-cdk.aws_lambda_destinations==1.142.0",
+        "aws-cdk.aws_sqs==1.142.0",
         "black==21.6b0",
         "pylint==2.10.2",
         "python-dotenv==0.17.0",
