@@ -2,7 +2,7 @@
 
 This project contains the infrastructure definition used in the article Async Lambda Function Retries with Backoff and Jitter on Bite-Sized Serverless: https://bitesizedserverless.com/bite/async-lambda-function-retries-with-backoff-and-jitter/
 
-The compiled CloudFormation files can be found in the `cdk.out` folder. The Python files for the Lambda functions are placed in `lambda/functions`.
+The compiled CloudFormation files can be found in the `cdk.out` folder. The Python files for the Lambda functions are placed in `lambda_functions`.
 
 To compile the CloudFormation templates, follow these steps:
 

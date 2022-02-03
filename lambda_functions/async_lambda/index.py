@@ -1,3 +1,5 @@
+"""The Async Lambda Function."""
+
 import time
 
 # To invoke this function from a MacOS terminal:
@@ -6,6 +8,7 @@ import time
 
 
 def event_handler(event, _context):
+    """Receive an async event, print its ID and raise an error."""
     attempt = 1
     original_payload = event
     if "_retry_metadata" in event:

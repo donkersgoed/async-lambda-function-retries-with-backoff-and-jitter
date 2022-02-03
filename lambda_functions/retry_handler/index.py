@@ -1,6 +1,9 @@
+"""The Retry Handler. Receive messages from the Retry Queue."""
+
 from datetime import datetime
 import json
 import os
+import random
 import time
 
 import boto3
@@ -12,21 +15,29 @@ MAX_VISIBILITY_TIMEOUT = 43200  # 12 hours
 
 async_function_name = os.environ["ASYNC_FUNCTION_NAME"]
 retry_queue_url = os.environ["RETRY_QUEUE_URL"]
-event_max_age = int(os.environ["MAX_AGE"])
+dlq_url = os.environ["DEAD_LETTER_QUEUE_URL"]
+event_max_age = max(86400, int(os.environ["MAX_AGE"]))
 event_max_retries = int(os.environ["MAX_RETRIES"])
-event_base_backoff = int(os.environ["BASE_BACKOFF"])
+event_base_backoff = min(1, int(os.environ["BASE_BACKOFF"]))
 
 
 class InitialReceiveError(Exception):
-    pass
+    """Empty exception to indicate initial receives."""
+
+
+class LambdaInvocationError(Exception):
+    """Empty exception to indicate failed Lambda invocations."""
 
 
 def event_handler(event: dict, _context) -> None:
+    """Receive a batch of events and return failures."""
     returned_message_ids = []
     for sqs_record in event["Records"]:
         try:
             handle_record(sqs_record)
         except InitialReceiveError:
+            returned_message_ids.append(sqs_record["messageId"])
+        except LambdaInvocationError:
             returned_message_ids.append(sqs_record["messageId"])
 
     # Report messages for which the timeout has changed as failures,
@@ -39,11 +50,12 @@ def event_handler(event: dict, _context) -> None:
 
 
 def handle_record(record: dict) -> None:
+    """Handle a SQS single record."""
     # Retrieve the ApproximateReceiveCount from the SQS Retry Queue
     sqs_approximate_receive_count = int(record["attributes"]["ApproximateReceiveCount"])
-    # If ApproximateReceiveCount equals one, this is the first time we
+    # If ApproximateReceiveCount is equal or lower than 1 (defensive), this is the first time we
     # fetched it from SQS, and it should be put back with a visibility timeout
-    first_receive_from_sqs = sqs_approximate_receive_count == 1
+    first_receive_from_sqs = sqs_approximate_receive_count <= 1
 
     # Retrieve the message from SQS
     sqs_body = json.loads(record["body"])
@@ -53,7 +65,7 @@ def handle_record(record: dict) -> None:
     if "_retry_metadata" not in lambda_function_payload:
         # If `_retry_metadata` is not present, this is the first time the
         # Lambda Function failed, and we're currently processing the first
-        # retry
+        # retry.
         event_retry_count = 1
         original_event_timestamp = int(
             datetime.timestamp(
@@ -62,7 +74,7 @@ def handle_record(record: dict) -> None:
         )
     else:
         # If `_retry_metadata` is present, this is the second or later time the
-        # Lambda Function failed. We can get the retry count from the function.
+        # Lambda Function failed. We can get the retry count from the metadata.
         event_retry_count = lambda_function_payload["_retry_metadata"]["attempt"] + 1
         original_event_timestamp = lambda_function_payload["_retry_metadata"][
             "initial_timestamp"
@@ -81,20 +93,26 @@ def handle_record(record: dict) -> None:
         # Return the message to the queue with the required backoff
         return_sqs_message_with_backoff(record, event_retry_count)
         raise InitialReceiveError()
-    else:
-        # Update the payload and call the Lambda Function again
-        retry_lambda_execution(lambda_function_payload, original_event_timestamp)
+
+    # Update the payload and call the Lambda Function again
+    retry_lambda_execution(lambda_function_payload, original_event_timestamp)
 
 
 def move_message_to_dlq(lambda_function_payload, reason):
+    """Send a message to the DLQ when retries have been exhausted or another error occurred."""
     original_payload = lambda_function_payload
     if "_retry_metadata" in lambda_function_payload:
         original_payload = lambda_function_payload["_original_payload"]
 
-    print(f"Deleting message ({reason}): {original_payload}")
+    sqs_client.send_message(
+        QueueUrl=dlq_url,
+        MessageBody=json.dumps(original_payload),
+        MessageAttributes={"Reason": {"StringValue": reason, "DataType": "String"}},
+    )
 
 
 def return_sqs_message_with_backoff(record: dict, event_retry_count: int) -> None:
+    """Calculate the backoff, apply jitter and set the visibility timeout of a message."""
     # Example 1: base_backoff = 1, event_retry_count = 1
     # visibility_timeout = 1 * 2 ^ (1-1) = 1 * 2^0 = 1 * 1 = 1 second
     # Example 2: base_backoff = 1, event_retry_count = 2
@@ -102,23 +120,26 @@ def return_sqs_message_with_backoff(record: dict, event_retry_count: int) -> Non
     # Example 3: base_backoff = 1, event_retry_count = 3
     # visibility_timeout = 1 * 2 ^ (3-1) = 1 * 2^2 = 1 * 4 = 4 seconds
     visibility_timeout = event_base_backoff * 2 ** (event_retry_count - 1)
-    # jitter here
+
+    # Add jitter by selecting a random value between the base backoff (generally 1)
+    # and the visibility timeout generated above.
+    timeout_with_jitter = round(random.uniform(event_base_backoff, visibility_timeout))
 
     # Never exceed MAX_VISIBILITY_TIMEOUT
-    visibility_timeout = min(MAX_VISIBILITY_TIMEOUT, visibility_timeout)
+    timeout_capped = min(MAX_VISIBILITY_TIMEOUT, timeout_with_jitter)
 
+    # Change the visibility of the SQS message
     sqs_client.change_message_visibility(
         QueueUrl=retry_queue_url,
         ReceiptHandle=record["receiptHandle"],
-        VisibilityTimeout=visibility_timeout,
+        VisibilityTimeout=timeout_capped,
     )
-
-    return  # End of processing
 
 
 def retry_lambda_execution(
     lambda_function_payload: dict, original_event_timestamp: int
 ) -> None:
+    """Wrap the event in a retry envelope and send it to the async Lambda Function again."""
     if "_retry_metadata" in lambda_function_payload:
         lambda_function_payload["_retry_metadata"]["attempt"] += 1
     else:
@@ -137,10 +158,15 @@ def retry_lambda_execution(
             InvocationType="Event",
             Payload=json.dumps(lambda_function_payload).encode("utf-8"),
         )
-    except Exception:
-        print("Failed to invoke Lambda")
-        move_message_to_dlq(lambda_function_payload)
-        return
+    except Exception as exc:  # pylint: disable=broad-except
+        # Raising a LambdaInvocationError will put the message back onto the queue,
+        # allowing it to be retried later.
+        raise LambdaInvocationError("Lambda invocation failed") from exc
 
-    if response["StatusCode"] != 202:
-        move_message_to_dlq(lambda_function_payload, "failed to invoke Lambda")
+    lambda_function_status_code = response["StatusCode"]
+    if lambda_function_status_code != 202:
+        # Raising a LambdaInvocationError will put the message back onto the queue, allowing
+        # it to be retried later.
+        raise LambdaInvocationError(
+            f"Invalid response from Lambda invocation: {lambda_function_status_code}"
+        )
