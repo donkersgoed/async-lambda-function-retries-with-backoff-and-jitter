@@ -11,7 +11,10 @@ import boto3
 sqs_client = boto3.client("sqs")
 lambda_client = boto3.client("lambda")
 
-MAX_VISIBILITY_TIMEOUT = 43200  # 12 hours
+# Set visibility timeout to 12 hours minus 30 seconds
+# Technically 43200 should work, but in practice it
+# often leads to errors
+MAX_VISIBILITY_TIMEOUT = 43170
 
 async_function_name = os.environ["ASYNC_FUNCTION_NAME"]
 retry_queue_url = os.environ["RETRY_QUEUE_URL"]
@@ -44,8 +47,8 @@ def event_handler(event: dict, _context) -> None:
             returned_message_ids.append(message_id)
         except LambdaInvocationError:
             returned_message_ids.append(message_id)
-        except Exception:  # pylint: disable=broad-except
-            print(f"Uncaught error for message ID {message_id}")
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"Uncaught error for message ID {message_id}: {type(exc)}, {exc}")
             returned_message_ids.append(message_id)
 
     # Report messages for which the timeout has changed as failures,
@@ -142,8 +145,8 @@ def return_sqs_message_with_backoff(record: dict, event_retry_count: int) -> Non
     max_visibility_time = initial_sent_to_sqs_timestamp_seconds + MAX_VISIBILITY_TIMEOUT
 
     # The seconds until the max_visibility_time
-    seconds_until_max_timeout = max_visibility_time - int(time.time())
-    timeout_capped = min(seconds_until_max_timeout, timeout_with_jitter)
+    seconds_until_timeout = max_visibility_time - int(time.time())
+    timeout_capped = min(seconds_until_timeout, timeout_with_jitter)
 
     # Change the visibility of the SQS message
     sqs_client.change_message_visibility(
