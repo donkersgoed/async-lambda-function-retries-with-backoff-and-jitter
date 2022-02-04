@@ -34,11 +34,19 @@ def event_handler(event: dict, _context) -> None:
     returned_message_ids = []
     for sqs_record in event["Records"]:
         try:
+            message_id = sqs_record["messageId"]
+        except KeyError:
+            print("Invalid event received: not an SQS record")
+
+        try:
             handle_record(sqs_record)
         except InitialReceiveError:
-            returned_message_ids.append(sqs_record["messageId"])
+            returned_message_ids.append(message_id)
         except LambdaInvocationError:
-            returned_message_ids.append(sqs_record["messageId"])
+            returned_message_ids.append(message_id)
+        except Exception:  # pylint: disable=broad-except
+            print(f"Uncaught error for message ID {message_id}")
+            returned_message_ids.append(message_id)
 
     # Report messages for which the timeout has changed as failures,
     # so that they are put back onto the queue.
@@ -126,7 +134,16 @@ def return_sqs_message_with_backoff(record: dict, event_retry_count: int) -> Non
     timeout_with_jitter = round(random.uniform(event_base_backoff, visibility_timeout))
 
     # Never exceed MAX_VISIBILITY_TIMEOUT
-    timeout_capped = min(MAX_VISIBILITY_TIMEOUT, timeout_with_jitter)
+    ## The time the message was initially received by SQS, in ms
+    initial_sent_to_sqs_timestamp_ms = int(record["attributes"]["SentTimestamp"])
+    ## The time the message was initially received by SQS, in seconds
+    initial_sent_to_sqs_timestamp_seconds = int(initial_sent_to_sqs_timestamp_ms / 1000)
+    ## The very last timestamp the message can be received from the queue
+    max_visibility_time = initial_sent_to_sqs_timestamp_seconds + MAX_VISIBILITY_TIMEOUT
+
+    # The seconds until the max_visibility_time
+    seconds_until_max_timeout = max_visibility_time - int(time.time())
+    timeout_capped = min(seconds_until_max_timeout, timeout_with_jitter)
 
     # Change the visibility of the SQS message
     sqs_client.change_message_visibility(

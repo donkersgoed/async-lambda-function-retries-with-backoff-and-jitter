@@ -29,11 +29,20 @@ class AsyncLambdaFunctionRetriesWithBackoffAndJitterStack(cdk.Stack):
         """Construct a new AsyncLambdaFunctionRetriesWithBackoffAndJitterStack."""
         super().__init__(scope, construct_id, **kwargs)
 
-        # The first queue, used to manage retries
-        retry_queue = sqs.Queue(scope=self, id="RetryQueue")
-
-        # The second queue, used to store messages when the retries failed
+        # The DLQ, used to store messages when all retries failed or system errors occurred
         dead_letter_queue = sqs.Queue(scope=self, id="DeadLetterQueue")
+
+        # The retry queue, through which retries are stored and backed off
+        retry_queue = sqs.Queue(
+            scope=self,
+            id="RetryQueue",
+            # Set a dead letter queue for retries. A retry should always be
+            # successfully managed by the Retry Handler. But if it isn't, it
+            # should be moved to the DLQ after 4 attempts.
+            dead_letter_queue=sqs.DeadLetterQueue(
+                max_receive_count=5, queue=dead_letter_queue
+            ),
+        )
 
         # The example async Lambda Function. This function will always fail, so
         # messages are always sent to the failure queue.
